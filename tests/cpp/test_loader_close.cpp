@@ -15,6 +15,7 @@
 
 namespace instanttensor {
 using std::unique_ptr;
+using chunk_id_t = int64_t;
 #include "production_rpc.inc"
 inline bool _env_debug() { return false; }
 template<typename... Args> void debug_log(const char*, Args...) {}
@@ -26,6 +27,9 @@ public:
     std::atomic<bool> stop{false};
     std::atomic<size_t> io_depth_sum{0}, io_depth_sample{1};
     SingleWorkerFunctionExecutor<> executor;
+    int world_size = 1;
+    size_t current_tensor_index = 0;
+    std::vector<int> tensors, chunks;
     bool pending = true;
     bool buffer_freed = false;
     bool file_closed = false;
@@ -33,6 +37,7 @@ public:
     int ordinary_requests = 0;
     void close(CloseArgs args);
     void run();
+    void wait_step(int64_t) { assert(false); } // single-rank close never drains
     void destroy_threads() { executor.join(); }
     void destroy_buffer() { buffer_freed = true; }
     void close_file() { file_closed = true; }

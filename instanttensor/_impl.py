@@ -328,6 +328,12 @@ class safe_open:
         process_group: Process group from ``torch.distributed`` for distributed
             loading, or ``None`` for single-process usage. When provided, InstantTensor
             uses NCCL to coordinate loading across processes for higher throughput.
+            All ranks must use the same selected chunk plan. Exiting the context
+            early drains the remaining selected GPU ranges before releasing
+            resources, even after a consumer exception. This can read the rest
+            of a large checkpoint, but does not materialize skipped tensors.
+            Completed loads add no reads. A failed or missing rank still requires
+            the caller's distributed timeout/termination policy.
         buffer_size: The size of the GPU buffer used for tensors in bytes.
             If ``None`` (default), uses ``INSTANTTENSOR_BUFFER_SIZE`` when set;
             otherwise automatically determined based on tensor sizes and I/O

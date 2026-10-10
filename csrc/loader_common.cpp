@@ -466,8 +466,18 @@ void Loader::open(OpenArgs args) {
 }
 
 void Loader::close(CloseArgs args) {
-    this->stop = true;
     auto t0 = std::chrono::high_resolution_clock::now();
+    if (this->world_size > 1 && !this->tensors.empty() && !this->chunks.empty()) {
+        // CLOSE can arrive after different amounts of asynchronous prefetch
+        // on each rank. Joining immediately can leave peers waiting for an
+        // AllGather that this rank never submitted. Finish the common selected
+        // chunk plan before stopping; no tensor materialization is needed.
+        // Cancellation therefore reads the remaining selected GPU ranges.
+        // Completed loads and single-rank cancellation perform no extra IO.
+        this->current_tensor_index = this->tensors.size() - 1;
+        this->wait_step(static_cast<chunk_id_t>(this->chunks.size()) - 1);
+    }
+    this->stop = true;
     this->destroy_threads();
     auto t1 = std::chrono::high_resolution_clock::now();
     this->destroy_buffer();

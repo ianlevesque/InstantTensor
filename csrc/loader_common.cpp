@@ -15,7 +15,7 @@ int Loader::next_executor_request_id() {
     return request_id;
 }
 
-Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
+Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue) {
     this->input_queue = std::move(input_queue);
     this->output_queue = std::move(output_queue);
     this->use_internal_memory_register = _env_use_internal_memory_register();
@@ -648,12 +648,13 @@ void Loader::run() {
             this->input_queue->pop(m);
             std::any ret = this->dispatch(m);
             this->output_queue->push(RPCResponse{m.id, std::move(ret)});
+            continue;
         }
         this->try_step();
     }
 }
 
-void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
+void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue) {
     try {
         Loader loader(std::move(input_queue), std::move(output_queue));
         loader.run();

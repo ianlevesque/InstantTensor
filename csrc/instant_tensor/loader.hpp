@@ -27,7 +27,7 @@ struct ChunkIOParams {
 class Loader {// NOTE: do not use any python object in pure C++ thread
 public:
     unique_ptr<SPSCQueue<RPCRequest>> input_queue;
-    unique_ptr<SPSCQueue<RPCResponse>> output_queue;
+    std::shared_ptr<SPSCQueue<RPCResponse>> output_queue;
 
     vector<FileInfo> file_info;
     bool use_internal_memory_register = false;
@@ -100,7 +100,7 @@ public:
     int next_executor_request_id();
 
     // Constructor
-    Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
+    Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
     // Common methods (loader_common.cpp)
     void open_file();
@@ -154,6 +154,6 @@ public:
     ChunkRequest post_read_chunk_uring(const ChunkIOParams &p);
 };
 
-void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
+void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
 } // namespace instanttensor

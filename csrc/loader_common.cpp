@@ -1,4 +1,7 @@
 #include <instant_tensor/loader.hpp>
+#include <instant_tensor/host_registration.hpp>
+
+namespace { constexpr size_t HOST_REGISTER_SEGMENT_SIZE = 256ULL * 1024 * 1024; }
 
 
 namespace instanttensor {
@@ -100,19 +103,69 @@ void Loader::init_buffer() {
         size_t host_buffer_size = inflight_host_buffer_size;
         this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
         if (this->host_buffer_entry.ptr == NULL) {
-            // aligned_alloc + cudaHostRegister is faster than cudaHostAlloc
-            this->host_buffer_entry.ptr = aligned_alloc(this->rank_alignment, host_buffer_size);
-            if (this->host_buffer_entry.ptr == NULL) {
-                throw std::runtime_error("Failed to allocate host buffer: " + std::string(strerror(errno)));
+            // Some CUDA driver/kernel combinations reject a multi-GiB
+            // cudaHostRegister call even though the same storage can be pinned
+            // in smaller adjacent ranges. A few driver/kernel combinations
+            // reject registration itself; cudaHostAlloc remains the portable
+            // pinned-memory fallback for those hosts.
+            const unsigned int runtime_alloc_flags =
+                this->cuda_host_register_flags
+                & (cudaHostAllocPortable | cudaHostAllocMapped);
+            HostBufferAllocation allocation = allocate_registered_host_buffer(
+                host_buffer_size,
+                this->rank_alignment,
+                this->cuda_host_register_flags,
+                runtime_alloc_flags,
+                HOST_REGISTER_SEGMENT_SIZE,
+                [](size_t alignment, size_t size) {
+                    return aligned_alloc(alignment, size);
+                },
+                [](void* ptr) { free(ptr); },
+                [](void* ptr, size_t size, unsigned int flags) {
+                    return static_cast<int>(cudaHostRegister(ptr, size, flags));
+                },
+                [](void* ptr) {
+                    return static_cast<int>(cudaHostUnregister(ptr));
+                },
+                []() { cudaGetLastError(); },
+                [](void** ptr, size_t size, unsigned int flags) {
+                    return static_cast<int>(cudaHostAlloc(ptr, size, flags));
+                }
+            );
+            this->host_buffer_entry.ptr = allocation.ptr;
+            if (allocation.runtime_allocated) {
+                fprintf(
+                    stderr,
+                    "[InstantTensor] cudaHostRegister paths failed for a %.2f "
+                    "GiB buffer; using runtime-allocated pinned memory. %s\n",
+                    host_buffer_size / static_cast<double>(1ULL << 30),
+                    allocation.registration_failure.c_str()
+                );
+            } else if (allocation.registration.whole_buffer_error != 0) {
+                fprintf(
+                    stderr,
+                    "[InstantTensor] cudaHostRegister rejected a %.2f GiB buffer "
+                    "(code %d); registered it as %zu segments instead.\n",
+                    host_buffer_size / static_cast<double>(1ULL << 30),
+                    allocation.registration.whole_buffer_error,
+                    allocation.registration.ranges.size()
+                );
             }
 
-            // NOTE: cudaHostRegisterReadOnly is not used since the host buffer is writable for the CPU
-            CUDA_CHECK(cudaHostRegister(this->host_buffer_entry.ptr, host_buffer_size, this->cuda_host_register_flags));
-
             this->host_buffer_entry.size = host_buffer_size;
-            this->host_buffer_entry.deleter = [](void *ptr) {
-                CUDA_CHECK(cudaHostUnregister(ptr));
-                free(ptr);
+            this->host_buffer_entry.deleter = [allocation](void* ptr) {
+                if (allocation.runtime_allocated) {
+                    CUDA_CHECK(cudaFreeHost(ptr));
+                } else {
+                    for (
+                        auto it = allocation.registration.ranges.rbegin();
+                        it != allocation.registration.ranges.rend();
+                        ++it
+                    ) {
+                        CUDA_CHECK(cudaHostUnregister(it->ptr));
+                    }
+                    free(ptr);
+                }
             };
         }
         this->host_buffer = (char*)this->host_buffer_entry.ptr;
@@ -515,8 +568,12 @@ void Loader::open(OpenArgs args) {
 }
 
 void Loader::close(CloseArgs args) {
-    this->stop = true;
     auto t0 = std::chrono::high_resolution_clock::now();
+    if (this->world_size > 1 && !this->tensors.empty() && !this->chunks.empty()) {
+        this->current_tensor_index = this->tensors.size() - 1;
+        this->wait_step(static_cast<chunk_id_t>(this->chunks.size()) - 1);
+    }
+    this->stop = true;
     this->destroy_threads();
     auto t1 = std::chrono::high_resolution_clock::now();
     this->destroy_buffer();

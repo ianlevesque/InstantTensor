@@ -15,7 +15,7 @@ from typing import Union, Generator, Optional, Callable, Literal
 import threading
 import atexit
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 def env_debug():
@@ -596,11 +596,16 @@ class safe_open:
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
             max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
             tensor_filter: Optional[list[str]] = None,
-            tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob"):
+            tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob",
+            defer_layout_validation: bool = False):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
         """ 
+        if defer_layout_validation and (load_now or not copy):
+            raise ValueError("defer_layout_validation requires load_now=False and copy=True")
+        self._defer_layout_validation = defer_layout_validation
+        self._layout_finalized = not defer_layout_validation
         self.init_time = time.perf_counter()
 
         if tensor_filter is not None and process_group is not None:
@@ -641,7 +646,9 @@ class safe_open:
             buffer_size, chunk_size, concurrency, io_depth,
             max_free_mem_usage, backend,
         )
-        self._determine_io_params(config)
+        self._determine_io_params(
+            replace(config, buffer_size=None) if defer_layout_validation else config
+        )
 
         self.meta_read_time = time.perf_counter()
 
@@ -673,7 +680,12 @@ class safe_open:
         self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
         self.total_tensor_size = sum(self.tensor_sizes)
 
-        self._finalize_buffer_size(config.buffer_size)
+        if defer_layout_validation:
+            # Metadata selection must finalize the exact selected native layout
+            # before any pipeline allocation. No provisional ring is allocated.
+            self.buffer_size = None
+        else:
+            self._finalize_buffer_size(config.buffer_size)
 
         if not self.copy and (tensor_filter is not None or self.buffer_size < self.total_tensor_size):
             warnings.warn(
@@ -866,6 +878,13 @@ class safe_open:
         self.backend = backend
 
     def _finalize_buffer_size(self, buffer_size):
+        if self._defer_layout_validation:
+            self._layout_finalized = False
+            if not self.tensor_sizes:
+                raise ValueError("Empty metadata-only layout must not open native I/O")
+            minimum = required_buffer_size_for_io(self.chunk_size, self.io_depth, self.world_size)
+            if buffer_size is not None and buffer_size < minimum:
+                raise ValueError(f"Selected ring cap ({buffer_size} B) is below I/O minimum ({minimum} B)")
         if buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
             buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
@@ -903,6 +922,16 @@ class safe_open:
                 f"buffer_size ({self.buffer_size} B) exceeds device memory "
                 f"budget ({self._device_memory_budget} B)"
             )
+
+        if self._defer_layout_validation:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            aligned_chunk = ((self.chunk_size + page_size - 1) // page_size) * page_size
+            host_staging = 0 if self.backend == Backend.CUFILE else self.io_depth * aligned_chunk
+            # Native init_buffer adds this alignment guard to device storage.
+            device_guard = 3 * (16 + page_size + page_size * self.world_size)
+            if self.buffer_size + device_guard + host_staging > self._device_memory_budget:
+                raise RuntimeError("Selected device/host staging exceeds memory budget")
+            self._layout_finalized = True
 
     def _read_metadata(self):
         meta_read_threads = []
@@ -943,6 +972,8 @@ class safe_open:
         return meta_read_results
 
     def _open(self):
+        if not self._layout_finalized:
+            raise RuntimeError("Metadata-only layout has not been finalized")
         self.open_time = time.perf_counter()
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = _C.open(
